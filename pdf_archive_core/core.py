@@ -697,7 +697,7 @@ def build_relative_output_path(
     if folder_style == "flat_year_month":
         parent = Path(decision.document_date.strftime("%Y-%m"))
     elif folder_style == "nested_year_monthword":
-        parent = Path(decision.document_date.strftime("%Y")) / decision.document_date.strftime("%m-%B")
+        parent = Path(decision.document_date.strftime("%Y")) / decision.document_date.strftime("%m-%b")
     else:
         raise ValueError(f"Unsupported folder_style: {folder_style}")
 
