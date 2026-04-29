@@ -30,6 +30,7 @@ class LMStudioConfig:
     base_url: str
     model: str
     batch_size: int = 5
+    max_input_tokens: int = 6000
     debug: bool = False
     timeout: int = 120
 
@@ -424,6 +425,51 @@ def build_lm_studio_document(doc_id: int, document: DocumentInput) -> dict[str, 
     }
 
 
+def estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+def estimate_payload_document_tokens(document_payload: dict[str, object]) -> int:
+    return estimate_tokens(json.dumps(document_payload, ensure_ascii=True))
+
+
+def batch_documents_for_lm_studio(
+    documents: list[DocumentInput],
+    lm_config: LMStudioConfig,
+    debug_logger: DebugLogger = None,
+) -> list[list[DocumentInput]]:
+    prompt_overhead = 600
+    batches: list[list[DocumentInput]] = []
+    current_batch: list[DocumentInput] = []
+    current_tokens = prompt_overhead
+
+    for document in documents:
+        doc_payload = build_lm_studio_document(0, document)
+        estimated_doc_tokens = estimate_payload_document_tokens(doc_payload)
+
+        exceeds_budget = current_batch and (current_tokens + estimated_doc_tokens > lm_config.max_input_tokens)
+        exceeds_count = current_batch and (len(current_batch) >= lm_config.batch_size)
+        if exceeds_budget or exceeds_count:
+            batches.append(current_batch)
+            current_batch = []
+            current_tokens = prompt_overhead
+
+        current_batch.append(document)
+        current_tokens += estimated_doc_tokens
+
+        if debug_logger and lm_config.debug:
+            debug_logger(
+                f"LM Studio token estimate source={document.source_name} doc_tokens={estimated_doc_tokens} "
+                f"batch_tokens={current_tokens} max_tokens={lm_config.max_input_tokens}"
+            )
+
+    if current_batch:
+        batches.append(current_batch)
+    return batches
+
+
 def parse_lm_studio_metadata_item(item: dict[str, object], document: DocumentInput) -> ParsedMetadata:
     full_text = document.extracted_text or ""
     page_texts = document.page_texts or []
@@ -544,16 +590,22 @@ def analyze_documents_batch(
             )
         )
 
-    parsed_results: list[Optional[ParsedMetadata]]
+    parsed_results: list[Optional[ParsedMetadata]] = [None] * len(prepared)
     if lm_config and lm_config.model:
-        try:
-            parsed_results = extract_metadata_batch_with_lm_studio(prepared, lm_config, debug_logger=debug_logger)
-        except Exception as exc:
-            if debug_logger:
-                debug_logger(f"LM Studio batch failed; falling back to heuristics. error={exc}")
-            parsed_results = [None] * len(prepared)
-    else:
-        parsed_results = [None] * len(prepared)
+        indexed_documents = list(enumerate(prepared))
+        batches = batch_documents_for_lm_studio(prepared, lm_config, debug_logger=debug_logger)
+        offset = 0
+        for batch in batches:
+            batch_indices = [index for index, _ in indexed_documents[offset:offset + len(batch)]]
+            try:
+                batch_results = extract_metadata_batch_with_lm_studio(batch, lm_config, debug_logger=debug_logger)
+            except Exception as exc:
+                if debug_logger:
+                    debug_logger(f"LM Studio batch failed; falling back to heuristics. error={exc}")
+                batch_results = [None] * len(batch)
+            for global_index, result in zip(batch_indices, batch_results):
+                parsed_results[global_index] = result
+            offset += len(batch)
 
     decisions: list[ArchiveDecision] = []
     for document, parsed in zip(prepared, parsed_results):
