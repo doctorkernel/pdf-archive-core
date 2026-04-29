@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -36,8 +37,7 @@ class LMStudioConfig:
     debug: bool = False
     timeout: int = 120
     endpoints: Optional[list[str]] = None
-    host_request_ordinal: Optional[int] = None
-    total_request_count: Optional[int] = None
+    request_counters: Optional[dict[str, object]] = None
 
     def endpoint_urls(self) -> list[str]:
         urls = [url.strip().rstrip("/") for url in (self.endpoints or []) if url and url.strip()]
@@ -586,8 +586,15 @@ Rules:
     }
     if lm_config.debug and debug_logger:
         host_label = urlparse(lm_config.base_url).hostname or lm_config.base_url
-        if lm_config.host_request_ordinal and lm_config.total_request_count:
-            debug_logger(f"{host_label} - #{lm_config.host_request_ordinal}/{lm_config.total_request_count}")
+        if lm_config.request_counters:
+            counter_lock = lm_config.request_counters["lock"]
+            with counter_lock:
+                per_host = lm_config.request_counters["per_host"]
+                per_host[host_label] = int(per_host.get(host_label, 0)) + 1
+                lm_config.request_counters["total"] = int(lm_config.request_counters.get("total", 0)) + 1
+                host_request_ordinal = per_host[host_label]
+                total_request_count = int(lm_config.request_counters["total"])
+            debug_logger(f"{host_label} - #{host_request_ordinal}/{total_request_count}")
         debug_logger(
             f"LM Studio request model={lm_config.model} base_url={lm_config.base_url} batch_size={len(documents)}"
         )
@@ -637,13 +644,15 @@ def analyze_documents_batch(
         batches = batch_documents_for_lm_studio(prepared, lm_config, debug_logger=debug_logger)
         endpoints = lm_config.endpoint_urls()
         batch_specs: list[tuple[list[int], list[DocumentInput], LMStudioConfig]] = []
-        host_request_counts = {endpoint: 0 for endpoint in endpoints}
-        total_request_count = len(batches)
+        request_counters = {
+            "lock": threading.Lock(),
+            "per_host": {},
+            "total": 0,
+        }
         offset = 0
         for batch_index, batch in enumerate(batches):
             batch_indices = list(range(offset, offset + len(batch)))
             endpoint = endpoints[batch_index % len(endpoints)]
-            host_request_counts[endpoint] += 1
             batch_lm_config = LMStudioConfig(
                 base_url=endpoint,
                 model=lm_config.model,
@@ -652,8 +661,7 @@ def analyze_documents_batch(
                 debug=lm_config.debug,
                 timeout=lm_config.timeout,
                 endpoints=None,
-                host_request_ordinal=host_request_counts[endpoint],
-                total_request_count=total_request_count,
+                request_counters=request_counters,
             )
             batch_specs.append((batch_indices, batch, batch_lm_config))
             offset += len(batch)
