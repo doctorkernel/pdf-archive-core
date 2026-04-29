@@ -42,6 +42,7 @@ class DocumentInput:
     sender: str = ""
     subject: str = ""
     extracted_text: Optional[str] = None
+    page_texts: Optional[list[str]] = None
 
 
 @dataclass
@@ -51,6 +52,7 @@ class ParsedMetadata:
     company_name: Optional[str] = None
     issue_date: Optional[date] = None
     due_date: Optional[date] = None
+    needs_review: bool = False
 
 
 @dataclass
@@ -62,6 +64,7 @@ class ArchiveDecision:
     document_date: date
     document_date_source: str
     extracted_text: str
+    needs_review: bool = False
 
 
 def sanitize_filename_part(text: str, max_len: int = 80) -> str:
@@ -74,13 +77,18 @@ def sanitize_filename_part(text: str, max_len: int = 80) -> str:
 
 
 def extract_pdf_text(pdf_bytes: bytes) -> str:
+    pages = extract_pdf_page_texts(pdf_bytes)
+    text = "\n".join(pages)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def extract_pdf_page_texts(pdf_bytes: bytes) -> list[str]:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     pages = []
     for page in reader.pages:
         pages.append(page.extract_text() or "")
-    text = "\n".join(pages)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return [re.sub(r"\n{3,}", "\n\n", page).strip() for page in pages]
 
 
 def try_parse_date(value: str) -> Optional[date]:
@@ -114,6 +122,7 @@ def choose_document_date(
     fallback_date: datetime,
     preferred_issue_date: Optional[date] = None,
     preferred_due_date: Optional[date] = None,
+    fallback_text: Optional[str] = None,
 ) -> tuple[date, str]:
     if preferred_issue_date:
         return preferred_issue_date, "document"
@@ -130,6 +139,18 @@ def choose_document_date(
     due_date = extract_field_date(text, ["due date", "payment due", "date due"])
     if due_date:
         return due_date, "due"
+
+    if fallback_text and fallback_text != text:
+        issued_date = extract_field_date(
+            fallback_text,
+            ["invoice date", "issue date", "issued", "date issued", "bill date", "statement date", "date paid"],
+        )
+        if issued_date:
+            return issued_date, "document-fallback"
+
+        due_date = extract_field_date(fallback_text, ["due date", "payment due", "date due"])
+        if due_date:
+            return due_date, "due-fallback"
 
     return fallback_date.astimezone().date(), "fallback"
 
@@ -347,29 +368,78 @@ def build_archive_title(
     return base_title
 
 
+def significant_words(text: str) -> set[str]:
+    words = set(re.findall(r"[A-Za-z]{4,}", text.lower()))
+    stop_words = {
+        "page",
+        "this",
+        "that",
+        "with",
+        "from",
+        "your",
+        "have",
+        "will",
+        "date",
+        "service",
+        "statement",
+        "invoice",
+        "receipt",
+        "patient",
+        "class",
+    }
+    return {word for word in words if word not in stop_words}
+
+
+def detect_mixed_document(page_texts: list[str]) -> bool:
+    if len(page_texts) < 2:
+        return False
+    first = page_texts[0].strip()
+    second = page_texts[1].strip()
+    if len(first) < 80 or len(second) < 80:
+        return False
+
+    first_words = significant_words(first)
+    second_words = significant_words(second)
+    if not first_words or not second_words:
+        return False
+
+    overlap = len(first_words & second_words)
+    ratio = overlap / max(1, min(len(first_words), len(second_words)))
+    return ratio < 0.08
+
+
 def build_lm_studio_document(doc_id: int, document: DocumentInput) -> dict[str, object]:
+    page_texts = document.page_texts or []
+    first_page_text = page_texts[0] if page_texts else (document.extracted_text or "")
+    second_page_text = page_texts[1] if len(page_texts) > 1 else ""
     return {
         "id": doc_id,
         "original_filename": document.source_name,
         "sender": document.sender,
         "subject": document.subject,
-        "pdf_text_excerpt": (document.extracted_text or "")[:12000],
+        "page_count": len(page_texts) if page_texts else 1,
+        "first_page_text_excerpt": first_page_text[:9000],
+        "second_page_text_excerpt": second_page_text[:5000],
+        "full_pdf_text_excerpt": (document.extracted_text or "")[:12000],
     }
 
 
 def parse_lm_studio_metadata_item(item: dict[str, object], document: DocumentInput) -> ParsedMetadata:
-    text = document.extracted_text or ""
+    full_text = document.extracted_text or ""
+    page_texts = document.page_texts or []
+    primary_text = page_texts[0] if page_texts else full_text
     title = sanitize_filename_part(str(item.get("title", "") or ""), max_len=50)
     category = str(item.get("category", "") or "").strip().lower()
     company_name = sanitize_filename_part(str(item.get("company_name", "") or ""), max_len=40)
     issue_date = try_parse_date(str(item.get("issue_date", "") or ""))
     due_date = try_parse_date(str(item.get("due_date", "") or ""))
+    needs_review = bool(item.get("needs_review", False))
 
     if category not in CATEGORY_CHOICES:
-        category = classify_by_keywords(text)
+        category = classify_by_keywords(primary_text)
     if not title:
         title = build_archive_title(
-            text,
+            primary_text,
             document.source_name,
             category,
             sender=document.sender,
@@ -383,6 +453,7 @@ def parse_lm_studio_metadata_item(item: dict[str, object], document: DocumentInp
         company_name=company_name or None,
         issue_date=issue_date,
         due_date=due_date,
+        needs_review=needs_review,
     )
 
 
@@ -404,18 +475,20 @@ def extract_metadata_batch_with_lm_studio(
 You are extracting metadata from PDFs for local archival.
 
 Return strict JSON only with this shape:
-{"documents":[{"id":0,"title":"","category":"","company_name":"","issue_date":null,"due_date":null}]}
+{"documents":[{"id":0,"title":"","category":"","company_name":"","issue_date":null,"due_date":null,"needs_review":false}]}
 
 Rules:
 - Return one object for each input document id.
 - category must be exactly one of: invoice, receipt, bill, electricity, gas.
 - title must be 2 to 7 words if present.
+- Base the title/category/company primarily on the first page.
 - Prefer vendor/company name plus document type if obvious.
 - If category is invoice, receipt, or bill, include the vendor/company name in the title.
 - Do not include dates in the title.
 - Do not include file extensions.
 - company_name should be the issuing company, not the billed customer and not an address or country.
 - issue_date and due_date must be YYYY-MM-DD when known, otherwise null.
+- Set needs_review to true when page 2 or later appears unrelated to page 1 or the PDF appears to contain mixed documents.
 """.strip()
 
     url = lm_config.base_url.rstrip("/") + "/v1/chat/completions"
@@ -457,7 +530,8 @@ def analyze_documents_batch(
 ) -> list[ArchiveDecision]:
     prepared: list[DocumentInput] = []
     for document in documents:
-        extracted_text = document.extracted_text if document.extracted_text is not None else extract_pdf_text(document.pdf_bytes)
+        page_texts = document.page_texts if document.page_texts is not None else extract_pdf_page_texts(document.pdf_bytes)
+        extracted_text = document.extracted_text if document.extracted_text is not None else re.sub(r"\n{3,}", "\n\n", "\n".join(page_texts)).strip()
         prepared.append(
             DocumentInput(
                 source_name=document.source_name,
@@ -466,6 +540,7 @@ def analyze_documents_batch(
                 sender=document.sender,
                 subject=document.subject,
                 extracted_text=extracted_text,
+                page_texts=page_texts,
             )
         )
 
@@ -482,10 +557,13 @@ def analyze_documents_batch(
 
     decisions: list[ArchiveDecision] = []
     for document, parsed in zip(prepared, parsed_results):
-        text = document.extracted_text or ""
+        full_text = document.extracted_text or ""
+        page_texts = document.page_texts or []
+        primary_text = page_texts[0] if page_texts else full_text
+        needs_review = detect_mixed_document(page_texts)
         if parsed is None:
-            category = classify_by_keywords(text)
-            title = build_archive_title(text, document.source_name, category, sender=document.sender, subject=document.subject)
+            category = classify_by_keywords(primary_text)
+            title = build_archive_title(primary_text, document.source_name, category, sender=document.sender, subject=document.subject)
             company_name = None
             issue_date = None
             due_date = None
@@ -495,12 +573,14 @@ def analyze_documents_batch(
             company_name = parsed.company_name
             issue_date = parsed.issue_date
             due_date = parsed.due_date
+            needs_review = needs_review or parsed.needs_review
 
         document_date, document_date_source = choose_document_date(
-            text,
+            primary_text,
             document.fallback_date,
             preferred_issue_date=issue_date,
             preferred_due_date=due_date,
+            fallback_text=full_text,
         )
         decisions.append(
             ArchiveDecision(
@@ -510,7 +590,8 @@ def analyze_documents_batch(
                 company_name=company_name,
                 document_date=document_date,
                 document_date_source=document_date_source,
-                extracted_text=text,
+                extracted_text=full_text,
+                needs_review=needs_review,
             )
         )
     return decisions
