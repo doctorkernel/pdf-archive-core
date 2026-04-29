@@ -1,6 +1,6 @@
 [project]
 name = "pdf-archive-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "Shared local-first PDF parsing, naming, and LM Studio metadata extraction"
 readme = "README.md"
 requires-python = ">=3.11"

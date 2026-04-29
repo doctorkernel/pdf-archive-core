@@ -8,6 +8,8 @@ from .core import (
     analyze_document,
     analyze_documents_batch,
     build_relative_output_path,
+    extract_pdf_page_texts,
+    is_low_signal_document,
     sanitize_filename_part,
     unique_output_path,
 )
@@ -22,6 +24,8 @@ __all__ = [
     "analyze_document",
     "analyze_documents_batch",
     "build_relative_output_path",
+    "extract_pdf_page_texts",
+    "is_low_signal_document",
     "sanitize_filename_part",
     "unique_output_path",
 ]
