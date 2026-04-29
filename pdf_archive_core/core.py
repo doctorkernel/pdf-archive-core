@@ -414,6 +414,13 @@ def is_low_signal_text(text: str, min_chars: int = 80) -> bool:
     return len(normalized) < min_chars
 
 
+def is_low_signal_document(document: DocumentInput) -> bool:
+    full_text = document.extracted_text or ""
+    page_texts = document.page_texts or []
+    primary_text = page_texts[0] if page_texts else full_text
+    return is_low_signal_text(primary_text) and is_low_signal_text(full_text, min_chars=120)
+
+
 def build_lm_studio_document(doc_id: int, document: DocumentInput) -> dict[str, object]:
     page_texts = document.page_texts or []
     first_page_text = page_texts[0] if page_texts else (document.extracted_text or "")
@@ -451,6 +458,18 @@ def batch_documents_for_lm_studio(
     current_tokens = prompt_overhead
 
     for document in documents:
+        if is_low_signal_document(document):
+            if current_batch:
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = prompt_overhead
+            batches.append([document])
+            if debug_logger and lm_config.debug:
+                debug_logger(
+                    f"LM Studio isolating low-signal document source={document.source_name} into a single-document batch"
+                )
+            continue
+
         doc_payload = build_lm_studio_document(0, document)
         estimated_doc_tokens = estimate_payload_document_tokens(doc_payload)
 
@@ -533,6 +552,8 @@ Rules:
 - category must be exactly one of: invoice, receipt, bill, electricity, gas.
 - title must be 2 to 7 words if present.
 - Base the title/category/company primarily on the first page.
+- Do not use names, titles, or organizations from any other document in the batch.
+- If a field is not clearly supported by the current document, leave it blank or null instead of guessing.
 - Prefer vendor/company name plus document type if obvious.
 - If category is invoice, receipt, or bill, include the vendor/company name in the title.
 - Do not include dates in the title.
