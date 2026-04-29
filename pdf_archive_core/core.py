@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
 import requests
@@ -33,6 +34,13 @@ class LMStudioConfig:
     max_input_tokens: int = 6000
     debug: bool = False
     timeout: int = 120
+    endpoints: Optional[list[str]] = None
+
+    def endpoint_urls(self) -> list[str]:
+        urls = [url.strip().rstrip("/") for url in (self.endpoints or []) if url and url.strip()]
+        if urls:
+            return urls
+        return [self.base_url.strip().rstrip("/")]
 
 
 @dataclass
@@ -574,7 +582,9 @@ Rules:
         ],
     }
     if lm_config.debug and debug_logger:
-        debug_logger(f"LM Studio request model={lm_config.model} base_url={lm_config.base_url} batch_size={len(documents)}")
+        debug_logger(
+            f"LM Studio request model={lm_config.model} base_url={lm_config.base_url} batch_size={len(documents)}"
+        )
         debug_logger(f"LM Studio request payload: {json.dumps(payload, ensure_ascii=True)[:12000]}")
 
     response = requests.post(url, json=payload, timeout=lm_config.timeout)
@@ -618,20 +628,57 @@ def analyze_documents_batch(
 
     parsed_results: list[Optional[ParsedMetadata]] = [None] * len(prepared)
     if lm_config and lm_config.model:
-        indexed_documents = list(enumerate(prepared))
         batches = batch_documents_for_lm_studio(prepared, lm_config, debug_logger=debug_logger)
+        endpoints = lm_config.endpoint_urls()
+        batch_specs: list[tuple[list[int], list[DocumentInput], LMStudioConfig]] = []
         offset = 0
-        for batch in batches:
-            batch_indices = [index for index, _ in indexed_documents[offset:offset + len(batch)]]
+        for batch_index, batch in enumerate(batches):
+            batch_indices = list(range(offset, offset + len(batch)))
+            endpoint = endpoints[batch_index % len(endpoints)]
+            batch_lm_config = LMStudioConfig(
+                base_url=endpoint,
+                model=lm_config.model,
+                batch_size=lm_config.batch_size,
+                max_input_tokens=lm_config.max_input_tokens,
+                debug=lm_config.debug,
+                timeout=lm_config.timeout,
+                endpoints=None,
+            )
+            batch_specs.append((batch_indices, batch, batch_lm_config))
+            offset += len(batch)
+
+        max_workers = max(1, min(len(batch_specs), len(endpoints)))
+        if debug_logger and lm_config.debug:
+            debug_logger(
+                f"LM Studio dispatch using {len(endpoints)} endpoint(s) with {max_workers} worker(s): {', '.join(endpoints)}"
+            )
+
+        def run_batch(
+            batch_indices: list[int],
+            batch: list[DocumentInput],
+            batch_lm_config: LMStudioConfig,
+        ) -> tuple[list[int], list[Optional[ParsedMetadata]]]:
             try:
-                batch_results = extract_metadata_batch_with_lm_studio(batch, lm_config, debug_logger=debug_logger)
+                return (
+                    batch_indices,
+                    extract_metadata_batch_with_lm_studio(batch, batch_lm_config, debug_logger=debug_logger),
+                )
             except Exception as exc:
                 if debug_logger:
-                    debug_logger(f"LM Studio batch failed; falling back to heuristics. error={exc}")
-                batch_results = [None] * len(batch)
-            for global_index, result in zip(batch_indices, batch_results):
-                parsed_results[global_index] = result
-            offset += len(batch)
+                    debug_logger(
+                        f"LM Studio batch failed on {batch_lm_config.base_url}; falling back to heuristics. error={exc}"
+                    )
+                return batch_indices, [None] * len(batch)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(run_batch, batch_indices, batch, batch_lm_config)
+                for batch_indices, batch, batch_lm_config in batch_specs
+            ]
+            for future in as_completed(futures):
+                batch_indices, batch_results = future.result()
+                for global_index, result in zip(batch_indices, batch_results):
+                    parsed_results[global_index] = result
 
     decisions: list[ArchiveDecision] = []
     for document, parsed in zip(prepared, parsed_results):
