@@ -8,6 +8,7 @@ from datetime import date, datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 import requests
 from pypdf import PdfReader
@@ -35,6 +36,8 @@ class LMStudioConfig:
     debug: bool = False
     timeout: int = 120
     endpoints: Optional[list[str]] = None
+    host_request_ordinal: Optional[int] = None
+    total_request_count: Optional[int] = None
 
     def endpoint_urls(self) -> list[str]:
         urls = [url.strip().rstrip("/") for url in (self.endpoints or []) if url and url.strip()]
@@ -582,6 +585,9 @@ Rules:
         ],
     }
     if lm_config.debug and debug_logger:
+        host_label = urlparse(lm_config.base_url).hostname or lm_config.base_url
+        if lm_config.host_request_ordinal and lm_config.total_request_count:
+            debug_logger(f"{host_label} - #{lm_config.host_request_ordinal}/{lm_config.total_request_count}")
         debug_logger(
             f"LM Studio request model={lm_config.model} base_url={lm_config.base_url} batch_size={len(documents)}"
         )
@@ -631,10 +637,13 @@ def analyze_documents_batch(
         batches = batch_documents_for_lm_studio(prepared, lm_config, debug_logger=debug_logger)
         endpoints = lm_config.endpoint_urls()
         batch_specs: list[tuple[list[int], list[DocumentInput], LMStudioConfig]] = []
+        host_request_counts = {endpoint: 0 for endpoint in endpoints}
+        total_request_count = len(batches)
         offset = 0
         for batch_index, batch in enumerate(batches):
             batch_indices = list(range(offset, offset + len(batch)))
             endpoint = endpoints[batch_index % len(endpoints)]
+            host_request_counts[endpoint] += 1
             batch_lm_config = LMStudioConfig(
                 base_url=endpoint,
                 model=lm_config.model,
@@ -643,6 +652,8 @@ def analyze_documents_batch(
                 debug=lm_config.debug,
                 timeout=lm_config.timeout,
                 endpoints=None,
+                host_request_ordinal=host_request_counts[endpoint],
+                total_request_count=total_request_count,
             )
             batch_specs.append((batch_indices, batch, batch_lm_config))
             offset += len(batch)
