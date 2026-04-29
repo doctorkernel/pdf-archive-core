@@ -409,6 +409,11 @@ def detect_mixed_document(page_texts: list[str]) -> bool:
     return ratio < 0.08
 
 
+def is_low_signal_text(text: str, min_chars: int = 80) -> bool:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    return len(normalized) < min_chars
+
+
 def build_lm_studio_document(doc_id: int, document: DocumentInput) -> dict[str, object]:
     page_texts = document.page_texts or []
     first_page_text = page_texts[0] if page_texts else (document.extracted_text or "")
@@ -613,6 +618,7 @@ def analyze_documents_batch(
         page_texts = document.page_texts or []
         primary_text = page_texts[0] if page_texts else full_text
         needs_review = detect_mixed_document(page_texts)
+        low_signal = is_low_signal_text(primary_text) and is_low_signal_text(full_text, min_chars=120)
         if parsed is None:
             category = classify_by_keywords(primary_text)
             title = build_archive_title(primary_text, document.source_name, category, sender=document.sender, subject=document.subject)
@@ -626,6 +632,10 @@ def analyze_documents_batch(
             issue_date = parsed.issue_date
             due_date = parsed.due_date
             needs_review = needs_review or parsed.needs_review
+
+        if low_signal:
+            title = original_filename_title(document.source_name)
+            needs_review = True
 
         document_date, document_date_source = choose_document_date(
             primary_text,
