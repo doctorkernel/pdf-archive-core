@@ -1,0 +1,13 @@
+[project]
+name = "pdf-archive-core"
+version = "0.1.0"
+description = "Shared local-first PDF parsing, naming, and LM Studio metadata extraction"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pypdf",
+  "requests",
+]
+
+[tool.setuptools.packages.find]
+include = ["pdf_archive_core*"]

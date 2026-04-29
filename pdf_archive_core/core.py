@@ -1,0 +1,561 @@
+from __future__ import annotations
+
+import io
+import json
+import re
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Callable, Optional
+
+import requests
+from pypdf import PdfReader
+
+
+DEFAULT_CATEGORY = "bill"
+CATEGORY_CHOICES = ("invoice", "receipt", "bill", "electricity", "gas")
+DATE_PATTERNS = (
+    "%m/%d/%Y",
+    "%m-%d-%Y",
+    "%Y-%m-%d",
+    "%B %d, %Y",
+    "%b %d, %Y",
+)
+
+DebugLogger = Optional[Callable[[str], None]]
+
+
+@dataclass
+class LMStudioConfig:
+    base_url: str
+    model: str
+    batch_size: int = 5
+    debug: bool = False
+    timeout: int = 120
+
+
+@dataclass
+class DocumentInput:
+    source_name: str
+    pdf_bytes: bytes
+    fallback_date: datetime
+    sender: str = ""
+    subject: str = ""
+    extracted_text: Optional[str] = None
+
+
+@dataclass
+class ParsedMetadata:
+    title: str
+    category: str
+    company_name: Optional[str] = None
+    issue_date: Optional[date] = None
+    due_date: Optional[date] = None
+
+
+@dataclass
+class ArchiveDecision:
+    source_name: str
+    title: str
+    category: str
+    company_name: Optional[str]
+    document_date: date
+    document_date_source: str
+    extracted_text: str
+
+
+def sanitize_filename_part(text: str, max_len: int = 80) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r'[\\/:*?"<>|]+', "", text)
+    text = text.strip(" .-_")
+    if not text:
+        text = "Untitled"
+    return text[:max_len].rstrip(" .-_")
+
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    pages = []
+    for page in reader.pages:
+        pages.append(page.extract_text() or "")
+    text = "\n".join(pages)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def try_parse_date(value: str) -> Optional[date]:
+    normalized = value.strip().replace("  ", " ")
+    for fmt in DATE_PATTERNS:
+        try:
+            return datetime.strptime(normalized, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def extract_field_date(text: str, labels: list[str]) -> Optional[date]:
+    escaped = "|".join(re.escape(label) for label in labels)
+    patterns = [
+        rf"(?im)\b(?:{escaped})\b\s*[:#-]?\s*([A-Za-z]{{3,9}}\s+\d{{1,2}},\s+\d{{4}})",
+        rf"(?im)\b(?:{escaped})\b\s*[:#-]?\s*(\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{4}})",
+        rf"(?im)\b(?:{escaped})\b\s*[:#-]?\s*(\d{{4}}-\d{{2}}-\d{{2}})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            parsed = try_parse_date(match.group(1))
+            if parsed:
+                return parsed
+    return None
+
+
+def choose_document_date(
+    text: str,
+    fallback_date: datetime,
+    preferred_issue_date: Optional[date] = None,
+    preferred_due_date: Optional[date] = None,
+) -> tuple[date, str]:
+    if preferred_issue_date:
+        return preferred_issue_date, "document"
+    if preferred_due_date:
+        return preferred_due_date, "due"
+
+    issued_date = extract_field_date(
+        text,
+        ["invoice date", "issue date", "issued", "date issued", "bill date", "statement date", "date paid"],
+    )
+    if issued_date:
+        return issued_date, "document"
+
+    due_date = extract_field_date(text, ["due date", "payment due", "date due"])
+    if due_date:
+        return due_date, "due"
+
+    return fallback_date.astimezone().date(), "fallback"
+
+
+def looks_like_company_name(line: str) -> bool:
+    stripped = line.strip()
+    if not (2 <= len(stripped) <= 60):
+        return False
+    lowered = stripped.lower()
+    banned = (
+        "invoice",
+        "receipt",
+        "bill to",
+        "payment history",
+        "description",
+        "amount due",
+        "date paid",
+        "date due",
+        "subtotal",
+        "total",
+        "page ",
+        "united states",
+        "california",
+        "texas",
+        "payment address",
+        "pay online",
+    )
+    if any(token in lowered for token in banned):
+        return False
+    if "@" in stripped:
+        return False
+    if re.search(r"\d{3,}", stripped):
+        return False
+    if re.search(r"\b(street|st|avenue|ave|road|rd|drive|dr|boulevard|blvd|lane|ln|court|ct|suite|ste|floor|fl|box|pmb)\b", lowered):
+        return False
+    if stripped.upper() == stripped and len(stripped.split()) > 6:
+        return False
+    words = stripped.split()
+    if not words:
+        return False
+    caps = sum(1 for word in words if word[:1].isupper())
+    return caps >= 1
+
+
+def score_company_name(line: str) -> int:
+    score = 0
+    if "," in line:
+        score += 2
+    lowered = line.lower()
+    if re.search(r"\b(inc|llc|ltd|corp|corporation|company|co|pbc|plc)\b", lowered):
+        score += 3
+    if len(line.split()) <= 4:
+        score += 1
+    return score
+
+
+def extract_company_name(text: str) -> Optional[str]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    anchor_patterns = [
+        r"(?im)^bill to$",
+        r"(?im)^invoice number\b",
+        r"(?im)^receipt number\b",
+        r"(?im)^date paid\b",
+        r"(?im)^date due\b",
+    ]
+    for anchor_pattern in anchor_patterns:
+        match = re.search(anchor_pattern, text)
+        if match:
+            anchor_line = match.group(0).strip().lower()
+            for index, line in enumerate(lines):
+                if line.strip().lower() == anchor_line:
+                    candidates = [
+                        candidate
+                        for candidate in reversed(lines[max(0, index - 6):index + 1])
+                        if looks_like_company_name(candidate)
+                    ]
+                    if candidates:
+                        best = max(candidates, key=score_company_name)
+                        return sanitize_filename_part(best, max_len=40)
+
+    candidates = [line for line in lines[:16] if looks_like_company_name(line)]
+    if candidates:
+        best = max(candidates, key=score_company_name)
+        return sanitize_filename_part(best, max_len=40)
+    return None
+
+
+def extract_company_name_from_sender(sender: str) -> Optional[str]:
+    match = re.search(r"<([^>]+)>", sender)
+    email = match.group(1) if match else sender
+    email = email.strip().lower()
+    if "@" not in email:
+        return None
+
+    domain = email.split("@", 1)[1]
+    company_part = domain.split(".", 1)[0]
+    company_part = re.sub(r"^(mail|email|info|support|billing|notifications?)\.", "", company_part)
+    company_part = re.sub(r"[-_]+", " ", company_part).strip()
+    if not company_part:
+        return None
+
+    words = [word for word in company_part.split() if word not in {"mail", "email"}]
+    if not words:
+        return None
+    return sanitize_filename_part(" ".join(word.capitalize() for word in words), max_len=40)
+
+
+def extract_company_name_from_subject(subject: str) -> Optional[str]:
+    cleaned = re.sub(r"(?i)\b(invoice|receipt|statement|bill|payment|paid|your|from)\b", " ", subject)
+    cleaned = re.sub(r"[^A-Za-z0-9&' -]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -")
+    if not cleaned:
+        return None
+
+    words = cleaned.split()
+    company_words = []
+    for word in words[:4]:
+        if re.search(r"\d", word):
+            break
+        company_words.append(word)
+    if not company_words:
+        return None
+    return sanitize_filename_part(" ".join(company_words), max_len=40)
+
+
+def classify_by_keywords(text: str) -> str:
+    lowered = text.lower()
+    rules = [
+        ("electricity", ["electricity", "electric", "kilowatt", "kwh", "meter read", "utility electric"]),
+        ("gas", ["natural gas", "gas service", "therms", "gas usage", "utility gas"]),
+        ("receipt", ["receipt", "amount paid", "payment history", "receipt number", "payment method"]),
+        ("invoice", ["invoice", "amount due", "remit", "invoice number", "tax invoice"]),
+        ("bill", ["bill", "statement", "balance due", "payment due"]),
+    ]
+    scores = {category: 0 for category in CATEGORY_CHOICES}
+    for category, keywords in rules:
+        for keyword in keywords:
+            scores[category] += lowered.count(keyword)
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else DEFAULT_CATEGORY
+
+
+def heuristic_title(text: str, original_filename: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    for line in lines[:20]:
+        if 4 <= len(line) <= 70 and not re.search(r"\b(page|date|account|invoice #|statement period)\b", line.lower()):
+            candidate = sanitize_filename_part(line, max_len=50)
+            if candidate:
+                return candidate
+
+    stem = Path(original_filename).stem
+    return sanitize_filename_part(stem.replace("_", " ").replace("-", " "), max_len=50)
+
+
+def original_filename_title(original_filename: str) -> str:
+    stem = Path(original_filename).stem
+    return sanitize_filename_part(stem.replace("_", " ").replace("-", " "), max_len=70)
+
+
+def should_keep_original_filename(text: str, derived_title: str, category: str, company_name: Optional[str]) -> bool:
+    normalized_text = re.sub(r"\s+", " ", text).strip()
+    if len(normalized_text) < 40:
+        return True
+
+    lowered_title = derived_title.strip().lower()
+    if not lowered_title:
+        return True
+
+    generic_titles = {"invoice", "receipt", "statement", "bill", "untitled"}
+    if lowered_title in generic_titles:
+        return True
+
+    if category in {"invoice", "receipt", "bill"} and not company_name and lowered_title in generic_titles:
+        return True
+
+    return False
+
+
+def build_archive_title(
+    text: str,
+    original_filename: str,
+    category: str,
+    sender: str = "",
+    subject: str = "",
+    preferred_company_name: Optional[str] = None,
+) -> str:
+    base_title = heuristic_title(text, original_filename)
+    company_name = None
+    if category in {"invoice", "receipt", "bill"}:
+        company_name = (
+            preferred_company_name
+            or extract_company_name(text)
+            or extract_company_name_from_sender(sender)
+            or extract_company_name_from_subject(subject)
+        )
+        if company_name:
+            lowered_base = base_title.lower()
+            if company_name.lower() not in lowered_base:
+                if any(keyword in lowered_base for keyword in ("invoice", "receipt", "statement", "bill")):
+                    titled = sanitize_filename_part(f"{company_name} {base_title}", max_len=70)
+                    if not should_keep_original_filename(text, titled, category, company_name):
+                        return titled
+                elif category == "receipt":
+                    titled = sanitize_filename_part(f"{company_name} Receipt", max_len=70)
+                    if not should_keep_original_filename(text, titled, category, company_name):
+                        return titled
+                else:
+                    titled = sanitize_filename_part(f"{company_name} Invoice", max_len=70)
+                    if not should_keep_original_filename(text, titled, category, company_name):
+                        return titled
+    if should_keep_original_filename(text, base_title, category, company_name):
+        return original_filename_title(original_filename)
+    return base_title
+
+
+def build_lm_studio_document(doc_id: int, document: DocumentInput) -> dict[str, object]:
+    return {
+        "id": doc_id,
+        "original_filename": document.source_name,
+        "sender": document.sender,
+        "subject": document.subject,
+        "pdf_text_excerpt": (document.extracted_text or "")[:12000],
+    }
+
+
+def parse_lm_studio_metadata_item(item: dict[str, object], document: DocumentInput) -> ParsedMetadata:
+    text = document.extracted_text or ""
+    title = sanitize_filename_part(str(item.get("title", "") or ""), max_len=50)
+    category = str(item.get("category", "") or "").strip().lower()
+    company_name = sanitize_filename_part(str(item.get("company_name", "") or ""), max_len=40)
+    issue_date = try_parse_date(str(item.get("issue_date", "") or ""))
+    due_date = try_parse_date(str(item.get("due_date", "") or ""))
+
+    if category not in CATEGORY_CHOICES:
+        category = classify_by_keywords(text)
+    if not title:
+        title = build_archive_title(
+            text,
+            document.source_name,
+            category,
+            sender=document.sender,
+            subject=document.subject,
+            preferred_company_name=company_name or None,
+        )
+
+    return ParsedMetadata(
+        title=title,
+        category=category,
+        company_name=company_name or None,
+        issue_date=issue_date,
+        due_date=due_date,
+    )
+
+
+def strip_json_fences(content: str) -> str:
+    stripped = content.strip()
+    fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        return fence_match.group(1).strip()
+    return stripped
+
+
+def extract_metadata_batch_with_lm_studio(
+    documents: list[DocumentInput],
+    lm_config: LMStudioConfig,
+    debug_logger: DebugLogger = None,
+) -> list[Optional[ParsedMetadata]]:
+    payload_documents = [build_lm_studio_document(index, document) for index, document in enumerate(documents)]
+    prompt = """
+You are extracting metadata from PDFs for local archival.
+
+Return strict JSON only with this shape:
+{"documents":[{"id":0,"title":"","category":"","company_name":"","issue_date":null,"due_date":null}]}
+
+Rules:
+- Return one object for each input document id.
+- category must be exactly one of: invoice, receipt, bill, electricity, gas.
+- title must be 2 to 7 words if present.
+- Prefer vendor/company name plus document type if obvious.
+- If category is invoice, receipt, or bill, include the vendor/company name in the title.
+- Do not include dates in the title.
+- Do not include file extensions.
+- company_name should be the issuing company, not the billed customer and not an address or country.
+- issue_date and due_date must be YYYY-MM-DD when known, otherwise null.
+""".strip()
+
+    url = lm_config.base_url.rstrip("/") + "/v1/chat/completions"
+    payload = {
+        "model": lm_config.model,
+        "temperature": 0.1,
+        "messages": [
+            {"role": "system", "content": "You return strict JSON."},
+            {"role": "user", "content": prompt},
+            {"role": "user", "content": json.dumps({"documents": payload_documents}, ensure_ascii=True)},
+        ],
+    }
+    if lm_config.debug and debug_logger:
+        debug_logger(f"LM Studio request model={lm_config.model} base_url={lm_config.base_url} batch_size={len(documents)}")
+        debug_logger(f"LM Studio request payload: {json.dumps(payload, ensure_ascii=True)[:12000]}")
+
+    response = requests.post(url, json=payload, timeout=lm_config.timeout)
+    if not response.ok:
+        if debug_logger:
+            debug_logger(f"LM Studio HTTP error status={response.status_code} body={response.text[:4000]}")
+        response.raise_for_status()
+    content = response.json()["choices"][0]["message"]["content"]
+    if lm_config.debug and debug_logger:
+        debug_logger(f"LM Studio raw response: {content[:12000]}")
+    parsed = json.loads(strip_json_fences(content))
+    raw_documents = parsed.get("documents", [])
+    by_id = {
+        int(item.get("id")): parse_lm_studio_metadata_item(item, documents[int(item.get("id"))])
+        for item in raw_documents
+        if str(item.get("id", "")).isdigit() and 0 <= int(item["id"]) < len(documents)
+    }
+    return [by_id.get(index) for index in range(len(documents))]
+
+
+def analyze_documents_batch(
+    documents: list[DocumentInput],
+    lm_config: Optional[LMStudioConfig] = None,
+    debug_logger: DebugLogger = None,
+) -> list[ArchiveDecision]:
+    prepared: list[DocumentInput] = []
+    for document in documents:
+        extracted_text = document.extracted_text if document.extracted_text is not None else extract_pdf_text(document.pdf_bytes)
+        prepared.append(
+            DocumentInput(
+                source_name=document.source_name,
+                pdf_bytes=document.pdf_bytes,
+                fallback_date=document.fallback_date,
+                sender=document.sender,
+                subject=document.subject,
+                extracted_text=extracted_text,
+            )
+        )
+
+    parsed_results: list[Optional[ParsedMetadata]]
+    if lm_config and lm_config.model:
+        try:
+            parsed_results = extract_metadata_batch_with_lm_studio(prepared, lm_config, debug_logger=debug_logger)
+        except Exception as exc:
+            if debug_logger:
+                debug_logger(f"LM Studio batch failed; falling back to heuristics. error={exc}")
+            parsed_results = [None] * len(prepared)
+    else:
+        parsed_results = [None] * len(prepared)
+
+    decisions: list[ArchiveDecision] = []
+    for document, parsed in zip(prepared, parsed_results):
+        text = document.extracted_text or ""
+        if parsed is None:
+            category = classify_by_keywords(text)
+            title = build_archive_title(text, document.source_name, category, sender=document.sender, subject=document.subject)
+            company_name = None
+            issue_date = None
+            due_date = None
+        else:
+            category = parsed.category
+            title = parsed.title
+            company_name = parsed.company_name
+            issue_date = parsed.issue_date
+            due_date = parsed.due_date
+
+        document_date, document_date_source = choose_document_date(
+            text,
+            document.fallback_date,
+            preferred_issue_date=issue_date,
+            preferred_due_date=due_date,
+        )
+        decisions.append(
+            ArchiveDecision(
+                source_name=document.source_name,
+                title=title,
+                category=category,
+                company_name=company_name,
+                document_date=document_date,
+                document_date_source=document_date_source,
+                extracted_text=text,
+            )
+        )
+    return decisions
+
+
+def analyze_document(
+    document: DocumentInput,
+    lm_config: Optional[LMStudioConfig] = None,
+    debug_logger: DebugLogger = None,
+) -> ArchiveDecision:
+    return analyze_documents_batch([document], lm_config=lm_config, debug_logger=debug_logger)[0]
+
+
+def build_relative_output_path(
+    decision: ArchiveDecision,
+    include_category: bool = True,
+    filename_suffix: str = "",
+    folder_style: str = "flat_year_month",
+) -> Path:
+    if folder_style == "flat_year_month":
+        parent = Path(decision.document_date.strftime("%Y-%m"))
+    elif folder_style == "nested_year_monthword":
+        parent = Path(decision.document_date.strftime("%Y")) / decision.document_date.strftime("%m-%B")
+    else:
+        raise ValueError(f"Unsupported folder_style: {folder_style}")
+
+    filename = f"{decision.document_date.strftime('%Y-%m-%d')} {decision.title}"
+    if include_category:
+        filename += f" ({decision.category})"
+    if filename_suffix:
+        filename += filename_suffix
+    filename = sanitize_filename_part(filename, max_len=140) + ".pdf"
+    return parent / filename
+
+
+def unique_output_path(base_dir: Path, filename: str) -> Path:
+    candidate = base_dir / filename
+    if not candidate.exists():
+        return candidate
+
+    stem = candidate.stem
+    suffix = candidate.suffix
+    counter = 2
+    while True:
+        alt = base_dir / f"{stem} [{counter}]{suffix}"
+        if not alt.exists():
+            return alt
+        counter += 1
